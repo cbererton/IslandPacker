@@ -32,22 +32,22 @@ class PackerConfig:
     # For a pair of islands, their effective min distance = average of both.
     # Note: BB-based repulsion underestimates ~5px for irregular shapes,
     # so these values should be ~5px above your actual desired minimum.
-    min_edge_distance_range: Tuple[int, int] = (20, 35)
+    min_edge_distance_range: Tuple[int, int] = (5, 10)
 
     # Per-island maximum edge distance is randomly chosen from this range.
     # Islands whose nearest neighbor exceeds their max distance get pulled in.
     # Set both to 0 to disable max distance enforcement.
-    max_edge_distance_range: Tuple[int, int] = (45, 70)
+    max_edge_distance_range: Tuple[int, int] = (15, 20)
 
     # Islands with area >= this threshold AND aspect ratio >= split_aspect_ratio
     # get split into 2 bounding boxes along their longest axis.
-    # This lets other islands nestle closer to elongated shapes.
+    # This lets other islands nestle closer to large shapes.
     # 0 = disabled (no splitting)
-    split_area_threshold: int = 2000
+    split_area_threshold: int = 1600
 
     # Minimum aspect ratio (max_dim / min_dim) to trigger splitting.
-    # Only islands that are both large AND elongated get split.
-    split_aspect_ratio: float = 1.8
+    # Set to 1.0 to split all islands above the area threshold regardless of shape.
+    split_aspect_ratio: float = 1.0
 
     # Filter: skip islands smaller than this many pixels (noise removal)
     min_island_area: int = 50
@@ -813,10 +813,10 @@ if __name__ == "__main__":
     output_file = sys.argv[2] if len(sys.argv) > 2 else "IslandMaskPacked.png"
 
     # Parse optional CLI args: min_lo min_hi max_lo max_hi canvas_w canvas_h
-    min_lo = int(sys.argv[3]) if len(sys.argv) > 3 else 20
-    min_hi = int(sys.argv[4]) if len(sys.argv) > 4 else 35
-    max_lo = int(sys.argv[5]) if len(sys.argv) > 5 else 45
-    max_hi = int(sys.argv[6]) if len(sys.argv) > 6 else 70
+    min_lo = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+    min_hi = int(sys.argv[4]) if len(sys.argv) > 4 else 10
+    max_lo = int(sys.argv[5]) if len(sys.argv) > 5 else 15
+    max_hi = int(sys.argv[6]) if len(sys.argv) > 6 else 20
     canvas_w = int(sys.argv[7]) if len(sys.argv) > 7 else 4096
     canvas_h = int(sys.argv[8]) if len(sys.argv) > 8 else 4096
 
@@ -827,8 +827,8 @@ if __name__ == "__main__":
         min_island_area=50,
         canvas_border_padding=30,
         crop_padding=5,
-        split_area_threshold=2000,
-        split_aspect_ratio=1.8,
+        split_area_threshold=1600,
+        split_aspect_ratio=1.0,
         max_iterations=3000,
         force_strength=2.0,
         attraction_strength=3.0,

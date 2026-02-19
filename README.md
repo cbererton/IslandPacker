@@ -23,14 +23,14 @@ pip install opencv-python numpy Pillow
 ## Usage
 
 ```bash
-# Basic usage (defaults: min_range=20-35, max_range=45-70, canvas=4096x4096)
+# Basic usage (defaults: min_range=5-10, max_range=15-20, canvas=4096x4096)
 python island_packer.py input.png output.png
 
 # Custom distance ranges: min_lo min_hi max_lo max_hi
-python island_packer.py input.png output.png 20 35 45 70
+python island_packer.py input.png output.png 5 10 15 20
 
 # Custom distance ranges + canvas size
-python island_packer.py input.png output.png 20 35 45 70 4096 4096
+python island_packer.py input.png output.png 5 10 15 20 4096 4096
 ```
 
 ### Arguments
@@ -39,10 +39,10 @@ python island_packer.py input.png output.png 20 35 45 70 4096 4096
 |----------|-------------|---------|
 | 1 | Input PNG (B&W island mask) | `IslandMaskBWV11.png` |
 | 2 | Output PNG | `IslandMaskPacked.png` |
-| 3 | Min edge distance range low (px) | `20` |
-| 4 | Min edge distance range high (px) | `35` |
-| 5 | Max edge distance range low (px) | `45` |
-| 6 | Max edge distance range high (px) | `70` |
+| 3 | Min edge distance range low (px) | `5` |
+| 4 | Min edge distance range high (px) | `10` |
+| 5 | Max edge distance range low (px) | `15` |
+| 6 | Max edge distance range high (px) | `20` |
 | 7 | Canvas width (px) | `4096` |
 | 8 | Canvas height (px) | `4096` |
 
@@ -73,10 +73,10 @@ Key parameters in `PackerConfig`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `min_edge_distance_range` | (20, 35) | Range for per-island minimum gap (px) |
-| `max_edge_distance_range` | (45, 70) | Range for per-island maximum gap (px) |
-| `split_area_threshold` | 2000 | Split islands with area ≥ this into 2 boxes (0 = disabled) |
-| `split_aspect_ratio` | 1.8 | Only split islands with aspect ratio ≥ this |
+| `min_edge_distance_range` | (5, 10) | Range for per-island minimum gap (px) |
+| `max_edge_distance_range` | (15, 20) | Range for per-island maximum gap (px) |
+| `split_area_threshold` | 1600 | Split islands with area ≥ this into 2 boxes (0 = disabled) |
+| `split_aspect_ratio` | 1.0 | Only split islands with aspect ratio ≥ this (1.0 = all large islands) |
 | `crop_padding` | 5 | Pixels of padding around content in cropped output |
 | `min_island_area` | 50 | Filter out islands smaller than this |
 | `canvas_border_padding` | 30 | Keep islands this far from canvas edges |
