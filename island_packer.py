@@ -736,47 +736,9 @@ def expand_into_gaps(islands: List[Island], source_islands: List[Island],
     return added
 
 
-def fill_gaps(islands: List[Island], config: PackerConfig) -> Tuple[int, List[Island]]:
-    """
-    After force-directed simulation, scan the rendered canvas for empty regions
-    *between* existing islands and place COPIES of small islands into those gaps.
-    Originals stay in place.
-
-    A gap is valid only if the surrounding area (2x the box size) contains at least
-    some island pixels — this prevents filling empty space at the edges of the
-    cluster. The placed copy also gets a padding margin around it so subsequent
-    copies don't touch it.
-
-    Scans with a sliding box of size max_edge_distance_range[1] x max_edge_distance_range[1],
-    stepping by half of min_edge_distance_range[0].
-
-    Small islands are cycled through round-robin so the same island can be copied
-    multiple times if there are more gaps than small islands.
-
-    Returns (number_of_copies_placed, list_of_new_copy_islands).
-    """
-    max_hi = config.max_edge_distance_range[1]
-    min_lo = config.min_edge_distance_range[0]
-
-    box_size = max_hi
-    step = max(1, min_lo // 2)
-    # Minimum gap padding around each placed copy
-    min_gap_pad = min_lo
-
-    if box_size <= 0:
-        return 0, []
-
-    # Find small islands that fit inside box_size x box_size
-    small_pool = [isl for isl in islands if isl.w <= box_size and isl.h <= box_size]
-
-    if not small_pool:
-        return 0, []
-
-    # Sort by area descending (prefer larger fills first)
-    small_pool.sort(key=lambda isl: isl.area, reverse=True)
-
-    # Render canvas with ALL islands to find current occupied pixels
-    W, H = config.canvas_size
+def _render_occupancy(islands: List[Island], canvas_size: Tuple[int, int]) -> np.ndarray:
+    """Render all islands onto a binary occupancy canvas."""
+    W, H = canvas_size
     canvas = np.zeros((H, W), dtype=np.uint8)
     for isl in islands:
         x, y = int(round(isl.x)), int(round(isl.y))
@@ -784,80 +746,127 @@ def fill_gaps(islands: List[Island], config: PackerConfig) -> Tuple[int, List[Is
         mx2, my2 = x2 - x, y2 - y
         if mx2 > 0 and my2 > 0:
             canvas[y:y2, x:x2] = np.maximum(canvas[y:y2, x:x2], isl.mask[:my2, :mx2])
+    return canvas
 
-    # Find the content bounding box (tight) to limit scanning
-    ys, xs = np.where(canvas > 0)
-    if len(xs) == 0:
-        return 0, []
-    content_x1 = int(xs.min())
-    content_y1 = int(ys.min())
-    content_x2 = int(xs.max())
-    content_y2 = int(ys.max())
 
-    # Check radius: a gap is only valid if nearby pixels contain island content
-    check_radius = box_size * 2
+def fill_gaps_pass(islands: List[Island], source_islands: List[Island],
+                   config: PackerConfig, rng: random.Random,
+                   gap_size: int,
+                   bounds: Optional[Tuple[int, int, int, int]] = None,
+                   ) -> int:
+    """
+    Single gap-fill pass: scan for empty regions of *gap_size* x *gap_size*
+    within *bounds* and place randomly-rotated copies of source islands that
+    are closest in size to the gap.
 
-    copies_placed = 0
-    new_islands = []
-    pool_idx = 0
+    Islands are selected by sorting candidates by how close their area is to
+    gap_size^2, then picking randomly from the top matches.
 
-    # Padded check box: the placed island + min_gap_pad on each side must be black
-    padded_size = box_size + 2 * min_gap_pad
+    Returns the number of copies placed (islands list is mutated in place).
+    """
+    min_lo = config.min_edge_distance_range[0]
+    pad = int(min_lo)
+    step = max(1, gap_size // 3)
 
-    # Scan with sliding box (within content bounds only)
-    for sy in range(content_y1, content_y2 - box_size + 1, step):
-        for sx in range(content_x1, content_x2 - box_size + 1, step):
-            # Check padded region is completely black (ensures spacing)
-            px1 = max(0, sx - min_gap_pad)
-            py1 = max(0, sy - min_gap_pad)
-            px2 = min(W, sx + box_size + min_gap_pad)
-            py2 = min(H, sy + box_size + min_gap_pad)
-            padded_region = canvas[py1:py2, px1:px2]
-            if padded_region.any():
+    W, H = config.canvas_size
+    canvas = _render_occupancy(islands, config.canvas_size)
+
+    # Content bounding box
+    if bounds is not None:
+        cx1, cy1, cx2, cy2 = bounds
+    else:
+        ys, xs = np.where(canvas > 0)
+        if len(xs) == 0:
+            return 0
+        cx1, cy1 = int(xs.min()), int(ys.min())
+        cx2, cy2 = int(xs.max()), int(ys.max())
+
+    # Build pool: islands whose smallest dimension fits in gap_size
+    # Sort by closeness to the target area (gap_size^2)
+    target_area = gap_size * gap_size
+    pool = [isl for isl in source_islands
+            if min(isl.w, isl.h) <= gap_size]
+    if not pool:
+        return 0
+
+    # Sort by distance to target area (closest first)
+    pool.sort(key=lambda isl: abs(isl.area - target_area))
+
+    # Keep the top candidates (closest in size)
+    top_n = max(5, len(pool) // 4)
+    pool = pool[:top_n]
+
+    min_lo_v, min_hi_v = config.min_edge_distance_range
+    max_lo_v, max_hi_v = config.max_edge_distance_range
+
+    # Check radius: only fill gaps that are between existing islands
+    check_radius = gap_size * 2
+
+    added = 0
+    for sy in range(cy1, cy2 - gap_size + 1, step):
+        for sx in range(cx1, cx2 - gap_size + 1, step):
+            # Check padded region is empty
+            rx1 = max(0, sx - pad)
+            ry1 = max(0, sy - pad)
+            rx2 = min(W, sx + gap_size + pad)
+            ry2 = min(H, sy + gap_size + pad)
+            if canvas[ry1:ry2, rx1:rx2].any():
                 continue
 
-            # Verify this is a gap BETWEEN islands, not empty fringe
-            # Check a larger surrounding area for any island content
-            cx1 = max(0, sx - check_radius)
-            cy1 = max(0, sy - check_radius)
-            cx2 = min(W, sx + box_size + check_radius)
-            cy2 = min(H, sy + box_size + check_radius)
-            surround = canvas[cy1:cy2, cx1:cx2]
-            if not surround.any():
+            # Verify gap is between islands, not empty fringe
+            sx1 = max(0, sx - check_radius)
+            sy1 = max(0, sy - check_radius)
+            sx2 = min(W, sx + gap_size + check_radius)
+            sy2 = min(H, sy + gap_size + check_radius)
+            if not canvas[sy1:sy2, sx1:sx2].any():
                 continue
 
-            # Cycle through small islands round-robin to find one that fits
-            for attempt in range(len(small_pool)):
-                src = small_pool[(pool_idx + attempt) % len(small_pool)]
-                if src.w <= box_size and src.h <= box_size:
-                    # Create a copy island
-                    copy = Island(
-                        id=src.id,
-                        mask=src.mask,
-                        area=src.area,
-                        original_centroid=src.original_centroid,
-                        my_min_dist=src.my_min_dist,
-                        my_max_dist=src.my_max_dist,
-                        boxes=[(0, 0, src.w, src.h)],
-                    )
-                    copy.x = float(sx + (box_size - src.w) // 2)
-                    copy.y = float(sy + (box_size - src.h) // 2)
+            # Pick a random island from the best-fit pool
+            src = rng.choice(pool)
+            mask = src.mask.copy()
+            if config.allow_rotation:
+                angle = rng.choice([0, 90, 180, 270])
+                if angle != 0:
+                    mask = np.rot90(mask, k=angle // 90)
 
-                    # Paint onto canvas (so subsequent scans see this copy)
-                    x, y = int(round(copy.x)), int(round(copy.y))
-                    x2, y2 = min(x + copy.w, W), min(y + copy.h, H)
-                    mx2, my2 = x2 - x, y2 - y
-                    if mx2 > 0 and my2 > 0:
-                        canvas[y:y2, x:x2] = np.maximum(
-                            canvas[y:y2, x:x2], copy.mask[:my2, :mx2]
-                        )
+            mh, mw = mask.shape
+            if mw > gap_size or mh > gap_size:
+                continue
 
-                    new_islands.append(copy)
-                    copies_placed += 1
-                    pool_idx = (pool_idx + attempt + 1) % len(small_pool)
-                    break
+            copy = Island(
+                id=src.id,
+                mask=mask,
+                area=src.area,
+                original_centroid=src.original_centroid,
+                my_min_dist=rng.uniform(min_lo_v, min_hi_v),
+                my_max_dist=rng.uniform(max_lo_v, max_hi_v),
+            )
+            compute_island_boxes(copy, config)
 
-    return copies_placed, new_islands
+            copy.x = float(sx + (gap_size - mw) // 2)
+            copy.y = float(sy + (gap_size - mh) // 2)
+            copy.vx = 0.0
+            copy.vy = 0.0
+
+            # Paint onto occupancy canvas
+            px_c = int(round(copy.x))
+            py_c = int(round(copy.y))
+            px2_c = min(px_c + copy.w, W)
+            py2_c = min(py_c + copy.h, H)
+            dw = px2_c - px_c
+            dh = py2_c - py_c
+            if dw > 0 and dh > 0:
+                canvas[py_c:py2_c, px_c:px2_c] = np.maximum(
+                    canvas[py_c:py2_c, px_c:px2_c], copy.mask[:dh, :dw]
+                )
+
+            # Mark the whole gap region so next scan step skips it
+            canvas[sy:sy + gap_size, sx:sx + gap_size] = 1
+
+            islands.append(copy)
+            added += 1
+
+    return added
 
 
 def render_packed_canvas(islands: List[Island], config: PackerConfig) -> np.ndarray:
@@ -1018,50 +1027,78 @@ def pack_islands(
     run_force_simulation(islands, config)
     print(f"Simulation: {time.time()-t1:.2f}s\n")
 
+    # Capture the cluster bounding box (used by expansion and gap fill)
+    source_islands = list(islands)  # snapshot of originals for copying
+    margin = config.expand_min_gap_size if config.expand_min_gap_size > 0 else 40
+    all_x1 = min(isl.x for isl in islands)
+    all_y1 = min(isl.y for isl in islands)
+    all_x2 = max(isl.x + isl.w for isl in islands)
+    all_y2 = max(isl.y + isl.h for isl in islands)
+    cluster_bounds = (
+        max(0, int(all_x1) - margin),
+        max(0, int(all_y1) - margin),
+        min(config.canvas_size[0], int(all_x2) + margin),
+        min(config.canvas_size[1], int(all_y2) + margin),
+    )
+
+    # Shorter sim config for expansion / gap-fill rounds
+    settle_cfg = PackerConfig(**{
+        f.name: getattr(config, f.name)
+        for f in config.__dataclass_fields__.values()
+    })
+    settle_cfg.max_iterations = 300
+    settle_cfg.convergence_threshold = 3.0
+
     # 3b. Expansion loop: find large empty regions, add rotated copies, re-simulate
     #     Constrained to the initial cluster bounding box so it doesn't grow outward.
-    source_islands = list(islands)  # snapshot of originals for copying
     total_expansion_copies = 0
     if config.expand_min_gap_size > 0:
         t_expand = time.time()
-
-        # Capture the initial cluster bounding box (with some margin)
-        margin = config.expand_min_gap_size
-        all_x1 = min(isl.x for isl in islands)
-        all_y1 = min(isl.y for isl in islands)
-        all_x2 = max(isl.x + isl.w for isl in islands)
-        all_y2 = max(isl.y + isl.h for isl in islands)
-        expand_bounds = (
-            max(0, int(all_x1) - margin),
-            max(0, int(all_y1) - margin),
-            min(config.canvas_size[0], int(all_x2) + margin),
-            min(config.canvas_size[1], int(all_y2) + margin),
-        )
-        print(f"  Expansion bounds: ({expand_bounds[0]},{expand_bounds[1]})-({expand_bounds[2]},{expand_bounds[3]})")
-
-        # Use a shorter sim for expansion rounds
-        expand_cfg = PackerConfig(**{
-            f.name: getattr(config, f.name)
-            for f in config.__dataclass_fields__.values()
-        })
-        expand_cfg.max_iterations = 300
-        expand_cfg.convergence_threshold = 3.0  # stop earlier, cluster is already mostly settled
+        print(f"  Expansion bounds: ({cluster_bounds[0]},{cluster_bounds[1]})-({cluster_bounds[2]},{cluster_bounds[3]})")
 
         for round_num in range(config.expand_max_rounds):
-            added = expand_into_gaps(islands, source_islands, config, rng, expand_bounds)
+            added = expand_into_gaps(islands, source_islands, config, rng, cluster_bounds)
             if added == 0:
                 print(f"  Expansion: no gaps >= {config.expand_min_gap_size}px remain after round {round_num + 1}")
                 break
             total_expansion_copies += added
             print(f"  Expansion round {round_num + 1}: added {added} copies ({len(islands)} total), re-simulating...")
-            run_force_simulation(islands, expand_cfg)
+            run_force_simulation(islands, settle_cfg)
             if added < 15:
                 print(f"  Expansion: diminishing returns ({added} < 15), stopping")
                 break
         print(f"Expansion: {total_expansion_copies} copies added in {time.time()-t_expand:.2f}s\n")
 
-    # 3c. Gap-filling pass: disabled
+    # 3c. Multi-pass gap filling: large gaps first, then progressively smaller.
+    #     Each pass scans for empty regions of that size and fills with a
+    #     randomly-rotated source island closest in size to the gap.
+    #     After all passes, re-run the force sim to settle the copies.
+    #     Recompute bounds from current positions (expansion + sim may have shifted).
+    cur_x1 = min(isl.x for isl in islands)
+    cur_y1 = min(isl.y for isl in islands)
+    cur_x2 = max(isl.x + isl.w for isl in islands)
+    cur_y2 = max(isl.y + isl.h for isl in islands)
+    fill_bounds = (
+        max(0, int(cur_x1)),
+        max(0, int(cur_y1)),
+        min(config.canvas_size[0], int(cur_x2)),
+        min(config.canvas_size[1], int(cur_y2)),
+    )
+
+    gap_fill_sizes = [200, 100, 50]
     gap_filled = 0
+    t_fill = time.time()
+    print(f"Multi-pass gap filling (large -> small), bounds ({fill_bounds[0]},{fill_bounds[1]})-({fill_bounds[2]},{fill_bounds[3]})...")
+    for gap_sz in gap_fill_sizes:
+        placed = fill_gaps_pass(islands, source_islands, config, rng,
+                                gap_sz, fill_bounds)
+        gap_filled += placed
+        print(f"  {gap_sz}x{gap_sz} pass: placed {placed} copies ({len(islands)} total)")
+
+    if gap_filled > 0:
+        print(f"  Re-simulating after gap fill ({gap_filled} copies)...")
+        run_force_simulation(islands, settle_cfg)
+    print(f"Gap fill: {gap_filled} copies in {time.time()-t_fill:.2f}s\n")
 
     # 4. Render
     canvas = render_packed_canvas(islands, config)

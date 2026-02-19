@@ -8,7 +8,7 @@ Extracts island blobs from a black & white PNG mask and repacks them onto a new 
 - **Force-Directed Packing** — Pushes overlapping islands apart (repulsion) and pulls distant islands closer (attraction) using vectorized NumPy computation
 - **Recursive Multi-Box Splitting** — Large islands (top 10%) are recursively split along their longest axis (up to 4 tight bounding boxes per island), letting other islands nestle closer
 - **Expansion Loop** — Iteratively finds large empty regions within the packed cluster and fills them with randomly-rotated copies of source islands, re-running the force sim each round until the cluster is dense
-- **Gap Filling** — After expansion, a final pass places copies of small islands into remaining tiny gaps between islands
+- **Multi-Pass Gap Filling** — After expansion, three progressively smaller passes (200→100→50px) fill remaining gaps with size-matched islands, then a final force sim settles the copies
 - **Debug Box Visualization** — Generates a second output image showing bounding boxes used for spacing overlaid in green
 - **Per-Island Distance Ranges** — Each island gets its own randomly chosen min/max distance from configurable ranges, creating organic non-uniform spacing
 - **8-Cardinal Ray Measurement** — Measures edge-to-edge distances in N/NE/E/SE/S/SW/W/NW from each island center
@@ -73,7 +73,7 @@ python check_gaps.py
    - **Attraction**: Nearest neighbor edge distance (squared, no sqrt); islands pulled closer when too far
    - For each pair, the effective distance = average of both islands' values
 6. **Expand** — Iteratively find large empty regions (>= `expand_min_gap_size`) within the initial cluster bounding box, add randomly-rotated copies of source islands, and re-run a short force sim. Repeats until gaps are filled or diminishing returns
-7. **Gap Fill** — Final pass scans for small empty regions and places copies of small islands into them (originals stay in place)
+7. **Gap Fill** — Three passes (200→100→50px) scan for empty regions and fill with size-matched island copies, then re-run force sim to settle
 8. **Render** — Paint all islands onto the output canvas + generate debug box visualization
 9. **Crop** — Auto-crop both outputs to content bounding box plus padding
 10. **Measure** — Report multi-box BB gap statistics and 8-cardinal-direction distances
