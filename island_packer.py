@@ -4,9 +4,10 @@ Island Mask Packer
 Extracts island blobs from a B&W PNG and repacks them with controlled
 edge-to-edge spacing using:
   - Connected Component Labeling (extraction)
-  - Force-Directed Separation with EDT (packing + distance measurement)
+  - Force-Directed Separation (packing)
+  - Per-island randomized min/max distances for organic spacing
 
-Dependencies: pip install opencv-python numpy scipy Pillow
+Dependencies: pip install opencv-python numpy Pillow
 """
 
 import cv2
@@ -26,14 +27,16 @@ class PackerConfig:
     # Canvas size for the output image
     canvas_size: Tuple[int, int] = (2048, 2048)
 
-    # Minimum pixel distance between the EDGES of any two islands
-    min_edge_distance: int = 20
+    # Per-island minimum edge distance is randomly chosen from this range.
+    # For a pair of islands, their effective min distance = average of both.
+    # Note: BB-based repulsion underestimates ~5px for irregular shapes,
+    # so these values should be ~5px above your actual desired minimum.
+    min_edge_distance_range: Tuple[int, int] = (20, 35)
 
-    # Maximum pixel distance from any island edge to another island edge,
-    # measured from the island center outward in 8 cardinal directions.
-    # Islands farther than this from ALL neighbors get pulled inward.
-    # 0 = disabled (no max distance enforcement)
-    max_edge_distance: int = 50
+    # Per-island maximum edge distance is randomly chosen from this range.
+    # Islands whose nearest neighbor exceeds their max distance get pulled in.
+    # Set both to 0 to disable max distance enforcement.
+    max_edge_distance_range: Tuple[int, int] = (45, 70)
 
     # Filter: skip islands smaller than this many pixels (noise removal)
     min_island_area: int = 50
@@ -45,14 +48,11 @@ class PackerConfig:
     canvas_border_padding: int = 30
 
     # Force-directed simulation settings
-    max_iterations: int = 200        # Max physics steps
-    force_strength: float = 1.5      # How hard islands push each other apart
-    attraction_strength: float = 2.0 # How hard islands pull toward neighbors (max dist)
-    damping: float = 0.7             # Velocity damping per step (0-1)
-    convergence_threshold: float = 0.5  # Stop when max movement < this (px)
-
-    # How many times to retry full layout if overlaps remain at end
-    max_layout_retries: int = 3
+    max_iterations: int = 3000       # Max physics steps
+    force_strength: float = 2.0      # How hard islands push each other apart
+    attraction_strength: float = 3.0 # How hard islands pull toward neighbors (max dist)
+    damping: float = 0.6             # Velocity damping per step (0-1)
+    convergence_threshold: float = 0.1  # Stop when max movement < this (px)
 
     # Random seed (None = random each run)
     seed: Optional[int] = 42
@@ -74,6 +74,10 @@ class Island:
     mask: np.ndarray          # Binary mask, tightly cropped (H x W, uint8 0/255)
     area: int                 # Pixel count
     original_centroid: Tuple[float, float]  # In the source image
+
+    # Per-island distance constraints (assigned randomly from config ranges)
+    my_min_dist: float = 20.0
+    my_max_dist: float = 50.0
 
     # Placement state (set during packing)
     x: float = 0.0           # Top-left x on canvas
@@ -250,9 +254,6 @@ def measure_cardinal_distances(
                 entry[dir_name] = float('inf')
             else:
                 # Distance from island edge to the hit pixel
-                gap_dx = px - (edge_x + ddx)  # from first gap pixel to hit pixel
-                gap_dy = py - (edge_y + ddy)
-                # Actually: distance from edge_x,edge_y to px,py minus 1 step
                 dist = math.sqrt((px - edge_x) ** 2 + (py - edge_y) ** 2)
                 entry[dir_name] = dist
 
@@ -301,52 +302,49 @@ def measure_all_distances(islands: List[Island], canvas_size: Tuple[int, int]) -
 
 def initial_placement(islands: List[Island], config: PackerConfig) -> None:
     """
-    Place islands in a tight cluster near the canvas center, using grid spacing
-    proportional to the target distance constraints. This ensures repulsion and
-    attraction forces both activate immediately.
+    Place islands in a scattered cluster near the canvas center.
+    Uses a Poisson-disk-like jittered placement to avoid grid artifacts.
+    Each island is placed at a random position within a loose cluster,
+    with enough spread for forces to separate them organically.
     """
     rng = random.Random(config.seed)
     W, H = config.canvas_size
 
-    # Target spacing: midpoint between min and max edge distance
-    if config.max_edge_distance > 0:
-        target_gap = (config.min_edge_distance + config.max_edge_distance) / 2.0
-    else:
-        target_gap = config.min_edge_distance * 2.0
+    # Midpoint of the distance ranges — used to size the cluster
+    avg_min = sum(config.min_edge_distance_range) / 2.0
+    avg_max = sum(config.max_edge_distance_range) / 2.0
+    target_gap = (avg_min + avg_max) / 2.0
 
     # Estimate average island size
     avg_size = math.sqrt(sum(isl.area for isl in islands) / len(islands))
 
     n = len(islands)
-    cols = max(1, int(math.sqrt(n)))
-    rows = max(1, math.ceil(n / cols))
 
-    # Cell size = average island size + target gap
+    # Cluster radius: pack islands into a roughly circular region
+    # Area needed ≈ n * (avg_island_size + target_gap)^2
     cell_size = avg_size + target_gap
+    cluster_area = n * cell_size * cell_size
+    cluster_radius = math.sqrt(cluster_area / math.pi) * 0.85  # tighter packing
 
-    # Center the grid on the canvas
-    grid_w = cols * cell_size
-    grid_h = rows * cell_size
-    start_x = (W - grid_w) / 2.0
-    start_y = (H - grid_h) / 2.0
+    cx_canvas, cy_canvas = W / 2.0, H / 2.0
 
-    for i, isl in enumerate(islands):
-        col = i % cols
-        row = i // cols
-
-        if config.allow_rotation and rng.random() > 0.5:
-            rotations = [0, 90, 180, 270]
-            angle = rng.choice(rotations)
+    for isl in islands:
+        # Apply random rotation
+        if config.allow_rotation:
+            angle = rng.choice([0, 90, 180, 270])
             if angle != 0:
                 isl.mask = np.rot90(isl.mask, k=angle // 90)
 
-        cx = start_x + col * cell_size + cell_size / 2.0
-        cy = start_y + row * cell_size + cell_size / 2.0
-        jitter_x = rng.uniform(-cell_size * 0.2, cell_size * 0.2)
-        jitter_y = rng.uniform(-cell_size * 0.2, cell_size * 0.2)
+        # Place at random position within the circular cluster
+        # Use rejection sampling for uniform distribution in a circle
+        while True:
+            rx = rng.uniform(-cluster_radius, cluster_radius)
+            ry = rng.uniform(-cluster_radius, cluster_radius)
+            if rx * rx + ry * ry <= cluster_radius * cluster_radius:
+                break
 
-        isl.x = cx + jitter_x - isl.w / 2
-        isl.y = cy + jitter_y - isl.h / 2
+        isl.x = cx_canvas + rx - isl.w / 2.0
+        isl.y = cy_canvas + ry - isl.h / 2.0
         isl.vx = 0.0
         isl.vy = 0.0
 
@@ -363,111 +361,121 @@ def clamp_to_canvas(isl: Island, config: PackerConfig) -> None:
     isl.y = max(pad, min(isl.y, H - isl.h - pad))
 
 
-
 def run_force_simulation(islands: List[Island], config: PackerConfig) -> None:
     """
-    Force-directed layout: islands repel each other to enforce min_edge_distance
-    and attract each other to enforce max_edge_distance.
+    Force-directed layout with per-island distance constraints.
+
+    Each island has its own my_min_dist and my_max_dist. For any pair (i, j):
+      - effective_min = (my_min_dist_i + my_min_dist_j) / 2
+      - effective_max = (my_max_dist_i + my_max_dist_j) / 2
+
+    This creates organic, non-uniform spacing.
 
     Vectorized with NumPy — all pairwise distances and forces computed as
-    bulk array operations, ~50-100x faster than the Python-loop version.
+    bulk array operations.
     """
     n = len(islands)
     strength = config.force_strength
     damping = config.damping
-    use_max_dist = config.max_edge_distance > 0
-    min_dist = config.min_edge_distance
-    max_dist = config.max_edge_distance
     attr_str = config.attraction_strength
 
     W_canvas, H_canvas = config.canvas_size
     pad = config.canvas_border_padding
 
-    # Pack island geometry into contiguous arrays for vectorized math
-    # pos[:,0] = x (top-left), pos[:,1] = y (top-left)
+    # Pack island geometry into contiguous arrays
     pos = np.zeros((n, 2), dtype=np.float64)
     vel = np.zeros((n, 2), dtype=np.float64)
     dims = np.zeros((n, 2), dtype=np.float64)  # w, h per island
+    min_dists = np.zeros(n, dtype=np.float64)   # per-island min distance
+    max_dists = np.zeros(n, dtype=np.float64)   # per-island max distance
 
     for i, isl in enumerate(islands):
         pos[i, 0] = isl.x
         pos[i, 1] = isl.y
         dims[i, 0] = isl.w
         dims[i, 1] = isl.h
+        min_dists[i] = isl.my_min_dist
+        max_dists[i] = isl.my_max_dist
 
-    half_dims = dims / 2.0  # half-widths, half-heights
-    half_dist = min_dist / 2.0
+    half_dims = dims / 2.0
+
+    # Pairwise effective distances: average of both islands' values
+    # eff_min[i,j] = (min_dists[i] + min_dists[j]) / 2
+    eff_min = (min_dists[:, None] + min_dists[None, :]) / 2.0   # (n, n)
+    eff_max = (max_dists[:, None] + max_dists[None, :]) / 2.0   # (n, n)
+    half_eff_min = eff_min / 2.0  # half of effective min distance per pair
+
+    # Check if max distance enforcement is enabled
+    use_max_dist = config.max_edge_distance_range[1] > 0
 
     for iteration in range(config.max_iterations):
         # Centers: pos + half_dims
         centers = pos + half_dims  # (n, 2)
 
-        # --- Vectorized repulsion (bounding box overlap) ---
-        # Expanded BB edges: x1, y1, x2, y2 per island (padded by half_dist)
-        bb_x1 = pos[:, 0] - half_dist           # (n,)
-        bb_y1 = pos[:, 1] - half_dist
-        bb_x2 = pos[:, 0] + dims[:, 0] + half_dist
-        bb_y2 = pos[:, 1] + dims[:, 1] + half_dist
+        # --- Vectorized repulsion (bounding box overlap with per-pair padding) ---
+        # Each pair has its own padding: half_eff_min[i,j]
+        # For efficiency, use per-island half-padding and sum for pairs
+        half_min_per_island = min_dists / 2.0  # (n,)
 
-        # Pairwise overlap: overlap_x[i,j] and overlap_y[i,j]
-        # overlap_x = min(x2_i, x2_j) - max(x1_i, x1_j)
+        bb_x1 = pos[:, 0] - half_min_per_island
+        bb_y1 = pos[:, 1] - half_min_per_island
+        bb_x2 = pos[:, 0] + dims[:, 0] + half_min_per_island
+        bb_y2 = pos[:, 1] + dims[:, 1] + half_min_per_island
+
+        # Pairwise overlap
         ox = np.minimum(bb_x2[:, None], bb_x2[None, :]) - np.maximum(bb_x1[:, None], bb_x1[None, :])
         oy = np.minimum(bb_y2[:, None], bb_y2[None, :]) - np.maximum(bb_y1[:, None], bb_y1[None, :])
 
-        # Only care about pairs with positive overlap on BOTH axes
         overlapping = (ox > 0) & (oy > 0)
-        np.fill_diagonal(overlapping, False)  # no self-interaction
+        np.fill_diagonal(overlapping, False)
 
-        # Direction vectors (center_i - center_j)
-        dx = centers[:, 0:1] - centers[:, 0:1].T  # (n, n)
+        # Direction vectors
+        dx = centers[:, 0:1] - centers[:, 0:1].T
         dy = centers[:, 1:2] - centers[:, 1:2].T
         dist = np.sqrt(dx * dx + dy * dy) + 1e-6
 
-        # Force magnitude: overlap_area / min_expanded_area, capped at 1.0
+        # Force magnitude: overlap_area / min_expanded_area
         overlap_area = np.maximum(ox, 0) * np.maximum(oy, 0)
-        expanded_w = dims[:, 0] + min_dist
-        expanded_h = dims[:, 1] + min_dist
-        expanded_area = expanded_w * expanded_h
-        min_area = np.minimum(expanded_area[:, None], expanded_area[None, :])
+        expanded_w = dims[:, 0:1] + min_dists[:, None]  # use island i's min_dist for expansion
+        expanded_h = dims[:, 1:2] + min_dists[:, None]
+        expanded_area_i = expanded_w * expanded_h
+        expanded_area_j = (dims[:, 0:1].T + min_dists[None, :]) * (dims[:, 1:2].T + min_dists[None, :])
+        min_area = np.minimum(expanded_area_i, expanded_area_j)
         force_mag = np.minimum(overlap_area / (min_area + 1e-6), 1.0)
         force_mag[~overlapping] = 0.0
 
-        # Force vectors: direction * magnitude
-        rep_fx = (dx / dist) * force_mag  # (n, n) — force on i from j
+        rep_fx = (dx / dist) * force_mag
         rep_fy = (dy / dist) * force_mag
 
-        # Sum repulsion forces per island
         forces = np.zeros((n, 2), dtype=np.float64)
         forces[:, 0] = rep_fx.sum(axis=1) * strength
         forces[:, 1] = rep_fy.sum(axis=1) * strength
 
-        # --- Vectorized attraction (nearest neighbor) ---
+        # --- Vectorized attraction (nearest neighbor, per-island max dist) ---
         if use_max_dist:
-            # BB edge-to-edge gap on each axis
+            # BB edge-to-edge gap
             gap_x = np.maximum(pos[:, 0:1].T - (pos[:, 0:1] + dims[:, 0:1]), 0) + \
                     np.maximum(pos[:, 0:1] - (pos[:, 0:1].T + dims[:, 0:1].T), 0)
             gap_y = np.maximum(pos[:, 1:2].T - (pos[:, 1:2] + dims[:, 1:2]), 0) + \
                     np.maximum(pos[:, 1:2] - (pos[:, 1:2].T + dims[:, 1:2].T), 0)
             edge_dist = np.sqrt(gap_x * gap_x + gap_y * gap_y)
 
-            # Find nearest neighbor per island (by edge distance)
             np.fill_diagonal(edge_dist, np.inf)
-            nn_idx = np.argmin(edge_dist, axis=1)  # (n,)
+            nn_idx = np.argmin(edge_dist, axis=1)
             nn_edge = edge_dist[np.arange(n), nn_idx]
 
-            # Only attract if nearest neighbor exceeds max_dist
-            needs_pull = nn_edge > max_dist
+            # Each island uses its own max_dist threshold
+            needs_pull = nn_edge > max_dists
             if needs_pull.any():
                 pull_idx = np.where(needs_pull)[0]
                 nn_of_pull = nn_idx[pull_idx]
 
-                # Direction from island toward its nearest neighbor
                 attr_dx = centers[nn_of_pull, 0] - centers[pull_idx, 0]
                 attr_dy = centers[nn_of_pull, 1] - centers[pull_idx, 1]
                 attr_dist = np.sqrt(attr_dx * attr_dx + attr_dy * attr_dy) + 1e-6
 
-                excess = nn_edge[pull_idx] - max_dist
-                attr_force = excess / (max_dist + 1e-6)
+                excess = nn_edge[pull_idx] - max_dists[pull_idx]
+                attr_force = excess / (max_dists[pull_idx] + 1e-6)
 
                 forces[pull_idx, 0] += (attr_dx / attr_dist) * attr_force * attr_str * strength
                 forces[pull_idx, 1] += (attr_dy / attr_dist) * attr_force * attr_str * strength
@@ -541,13 +549,16 @@ def pack_islands(
         random.seed(config.seed)
         np.random.seed(config.seed)
 
+    min_lo, min_hi = config.min_edge_distance_range
+    max_lo, max_hi = config.max_edge_distance_range
+
     print(f"=== Island Packer ===")
     print(f"Input:  {input_path}")
     print(f"Output: {output_path}")
     print(f"Canvas: {config.canvas_size[0]}x{config.canvas_size[1]}")
-    print(f"Min edge distance: {config.min_edge_distance}px")
-    if config.max_edge_distance > 0:
-        print(f"Max edge distance: {config.max_edge_distance}px (8-cardinal)")
+    print(f"Min edge distance range: {min_lo}-{min_hi}px")
+    if max_hi > 0:
+        print(f"Max edge distance range: {max_lo}-{max_hi}px (8-cardinal)")
     print()
 
     # 1. Extract
@@ -562,12 +573,24 @@ def pack_islands(
     rng = random.Random(config.seed)
     rng.shuffle(islands)
 
-    # 2. Initial placement
-    print("Placing islands (initial grid)...")
+    # Assign per-island random min/max distances
+    for isl in islands:
+        isl.my_min_dist = rng.uniform(min_lo, min_hi)
+        isl.my_max_dist = rng.uniform(max_lo, max_hi)
+
+    print("Per-island distance stats:")
+    all_mins = [isl.my_min_dist for isl in islands]
+    all_maxs = [isl.my_max_dist for isl in islands]
+    print(f"  min_dist range: {min(all_mins):.1f} - {max(all_mins):.1f} (mean {sum(all_mins)/len(all_mins):.1f})")
+    print(f"  max_dist range: {min(all_maxs):.1f} - {max(all_maxs):.1f} (mean {sum(all_maxs)/len(all_maxs):.1f})")
+    print()
+
+    # 2. Initial placement (scattered, not grid)
+    print("Placing islands (scattered cluster)...")
     initial_placement(islands, config)
     print("Done.\n")
 
-    # 3. Force-directed simulation (uses bounding box overlap, not circular approx)
+    # 3. Force-directed simulation
     print("Running force-directed simulation...")
     t1 = time.time()
     run_force_simulation(islands, config)
@@ -578,18 +601,18 @@ def pack_islands(
     cv2.imwrite(output_path, canvas)
     print(f"Saved: {output_path}")
 
-    # 5. Measure distances (EDT-based nearest neighbor)
-    print("\nMeasuring edge-to-edge distances (EDT)...")
+    # 5. Measure distances (BB nearest neighbor)
+    print("\nMeasuring edge-to-edge distances (BB)...")
     stats = measure_all_distances(islands, config.canvas_size)
     stats["total_islands"] = len(islands)
     stats["canvas"] = f"{config.canvas_size[0]}x{config.canvas_size[1]}"
-    stats["min_edge_distance_target"] = config.min_edge_distance
+    stats["min_edge_distance_range"] = f"{min_lo}-{min_hi}"
+    stats["max_edge_distance_range"] = f"{max_lo}-{max_hi}"
 
     # 6. Measure 8-cardinal-direction distances
-    if config.max_edge_distance > 0:
+    if max_hi > 0:
         print("Measuring 8-cardinal-direction distances...")
         cardinal = measure_cardinal_distances(islands, config.canvas_size)
-        stats["max_edge_distance_target"] = config.max_edge_distance
 
         dir_names = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
         violations = 0
@@ -597,9 +620,7 @@ def pack_islands(
         max_cardinal_nearest = 0.0
         cardinal_nearests = []
 
-        for entry in cardinal:
-            # For each island, find the minimum distance across all 8 directions
-            # (= nearest island in any cardinal direction)
+        for idx, entry in enumerate(cardinal):
             finite_dists = [entry[d] for d in dir_names if entry[d] != float('inf')]
             if finite_dists:
                 nearest = min(finite_dists)
@@ -607,10 +628,10 @@ def pack_islands(
                 min_cardinal_nearest = min(min_cardinal_nearest, nearest)
                 max_cardinal_nearest = max(max_cardinal_nearest, nearest)
 
-                # Check if ALL 8 directions exceed max_edge_distance
-                # (meaning no neighbor is reachable within the max distance)
+                # Check if ALL 8 directions exceed this island's max distance
+                isl_max = islands[idx].my_max_dist
                 all_exceed = all(
-                    entry[d] > config.max_edge_distance for d in dir_names
+                    entry[d] > isl_max for d in dir_names
                 )
                 if all_exceed:
                     violations += 1
@@ -642,22 +663,24 @@ if __name__ == "__main__":
     input_file = sys.argv[1] if len(sys.argv) > 1 else "IslandMaskBWV11.png"
     output_file = sys.argv[2] if len(sys.argv) > 2 else "IslandMaskPacked.png"
 
-    # Parse optional CLI args
-    min_gap = int(sys.argv[3]) if len(sys.argv) > 3 else 20
-    max_gap = int(sys.argv[4]) if len(sys.argv) > 4 else 50
-    canvas_w = int(sys.argv[5]) if len(sys.argv) > 5 else 4096
-    canvas_h = int(sys.argv[6]) if len(sys.argv) > 6 else 4096
+    # Parse optional CLI args: min_lo min_hi max_lo max_hi canvas_w canvas_h
+    min_lo = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+    min_hi = int(sys.argv[4]) if len(sys.argv) > 4 else 35
+    max_lo = int(sys.argv[5]) if len(sys.argv) > 5 else 45
+    max_hi = int(sys.argv[6]) if len(sys.argv) > 6 else 70
+    canvas_w = int(sys.argv[7]) if len(sys.argv) > 7 else 4096
+    canvas_h = int(sys.argv[8]) if len(sys.argv) > 8 else 4096
 
     cfg = PackerConfig(
         canvas_size=(canvas_w, canvas_h),
-        min_edge_distance=min_gap,
-        max_edge_distance=max_gap,
+        min_edge_distance_range=(min_lo, min_hi),
+        max_edge_distance_range=(max_lo, max_hi),
         min_island_area=50,
         canvas_border_padding=30,
         max_iterations=3000,
-        force_strength=1.5,
+        force_strength=2.0,
         attraction_strength=3.0,
-        damping=0.65,
+        damping=0.6,
         convergence_threshold=0.1,
         allow_rotation=True,
         seed=42,
