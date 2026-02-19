@@ -7,7 +7,7 @@ Extracts island blobs from a black & white PNG mask and repacks them onto a new 
 - **Connected Component Labeling** — Extracts individual islands from a B&W mask image using OpenCV
 - **Force-Directed Packing** — Pushes overlapping islands apart (repulsion) and pulls distant islands closer (attraction) using vectorized NumPy computation
 - **Recursive Multi-Box Splitting** — Large islands (top 10%) are recursively split along their longest axis (up to 4 tight bounding boxes per island), letting other islands nestle closer
-- **Expansion Loop** — Iteratively finds large empty regions within the packed cluster and fills them with randomly-rotated copies of source islands, re-running the force sim each round until the cluster is dense
+- **Expansion Loop** — Iteratively places randomly-rotated copies of source islands at scattered random positions within the initial cluster footprint (no grid artifacts), re-running the force sim each round until the cluster is dense
 - **Gap Filling** — After expansion, a final pass places copies of small islands into remaining tiny gaps between islands
 - **Debug Box Visualization** — Generates a second output image showing bounding boxes used for spacing overlaid in green
 - **Per-Island Distance Ranges** — Each island gets its own randomly chosen min/max distance from configurable ranges, creating organic non-uniform spacing
@@ -72,7 +72,7 @@ python check_gaps.py
    - **Repulsion**: Island-level BB gap checks; sparse pair indexing for efficiency
    - **Attraction**: Nearest neighbor edge distance (squared, no sqrt); islands pulled closer when too far
    - For each pair, the effective distance = average of both islands' values
-6. **Expand** — Iteratively find large empty regions (>= `expand_min_gap_size`) within the initial cluster bounding box, add randomly-rotated copies of source islands, and re-run a short force sim. Repeats until gaps are filled or diminishing returns
+6. **Expand** — Iteratively place randomly-rotated copies of source islands at scattered random positions within the initial cluster footprint (no grid), verify they don't overlap existing content, and re-run a short force sim. Repeats up to `expand_max_rounds` times
 7. **Gap Fill** — Final pass scans for small empty regions and places copies of small islands into them (originals stay in place)
 8. **Render** — Paint all islands onto the output canvas + generate debug box visualization
 9. **Crop** — Auto-crop both outputs to content bounding box plus padding
@@ -90,7 +90,7 @@ Key parameters in `PackerConfig`:
 | `split_aspect_ratio` | 1.0 | Only split islands with aspect ratio >= this (1.0 = all large islands) |
 | `max_splits` | 2 | Max recursive splits per island (2 = up to 4 boxes) |
 | `expand_min_gap_size` | 40 | Minimum empty region size (px) to trigger expansion (0 = disabled) |
-| `expand_max_rounds` | 10 | Maximum expansion iterations |
+| `expand_max_rounds` | 3 | Maximum expansion iterations |
 | `crop_padding` | 5 | Pixels of padding around content in cropped output |
 | `min_island_area` | 50 | Filter out islands smaller than this |
 | `canvas_border_padding` | 30 | Keep islands this far from canvas edges |
@@ -107,9 +107,9 @@ Key parameters in `PackerConfig`:
 Tested with 857 islands on a 4096x4096 canvas:
 - Extraction: ~0.06s
 - Initial force simulation: ~7s (sparse COO + float32 vectorized NumPy)
-- Expansion (10 rounds): ~17s
-- Gap filling: ~1.4s
-- Total: ~30s
+- Expansion (3 rounds, scattered placement): ~1.3s
+- Gap filling: ~1.1s
+- Total: ~12s
 
 ## License
 

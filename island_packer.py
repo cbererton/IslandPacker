@@ -84,7 +84,7 @@ class PackerConfig:
     expand_min_gap_size: int = 40
 
     # Maximum expansion rounds (each round: find gaps, add copies, re-simulate)
-    expand_max_rounds: int = 10
+    expand_max_rounds: int = 3
 
     # Debug: save intermediate steps
     debug_output: bool = False
@@ -621,17 +621,46 @@ def run_force_simulation(islands: List[Island], config: PackerConfig) -> None:
 # Step 4: Render output
 # ---------------------------------------------------------------------------
 
-def find_empty_regions(islands: List[Island], config: PackerConfig,
-                       min_size: int,
-                       bounds: Optional[Tuple[int, int, int, int]] = None,
-                       ) -> List[Tuple[int, int, int, int]]:
+def expand_into_gaps(islands: List[Island], source_islands: List[Island],
+                     config: PackerConfig, rng: random.Random,
+                     bounds: Tuple[int, int, int, int],
+                     ) -> int:
     """
-    Render the current island layout and find rectangular empty regions
-    at least min_size x min_size within the given bounds.
+    Place randomly-rotated copies of source islands into empty areas within
+    *bounds* using scattered random placement (like initial_placement), NOT
+    a grid scan.  This avoids the regular / grid-like pattern that a sliding-
+    window approach produces.
 
-    bounds: (x1, y1, x2, y2) to limit scanning. If None, uses the content BB.
-    Returns list of (x, y, w, h) regions.
+    For each candidate copy we render a quick occupancy check against a
+    rasterised canvas so copies don't overlap existing content.
+
+    The copies are appended to *islands* (mutated in place) so a subsequent
+    force sim can settle them.
+
+    Returns the number of copies added.
     """
+    min_size = config.expand_min_gap_size
+    if min_size <= 0:
+        return 0
+
+    bx1, by1, bx2, by2 = bounds
+    bw = bx2 - bx1
+    bh = by2 - by1
+    if bw <= 0 or bh <= 0:
+        return 0
+
+    # Build pool of source islands small enough to fit in typical gaps
+    pool = [isl for isl in source_islands
+            if min(isl.w, isl.h) <= min_size * 2]
+    if not pool:
+        pool = [isl for isl in source_islands if min(isl.w, isl.h) <= min_size]
+    if not pool:
+        return 0
+
+    min_lo, min_hi = config.min_edge_distance_range
+    max_lo, max_hi = config.max_edge_distance_range
+
+    # Render current occupancy as a binary canvas for fast overlap checks
     W, H = config.canvas_size
     canvas = np.zeros((H, W), dtype=np.uint8)
     for isl in islands:
@@ -641,77 +670,50 @@ def find_empty_regions(islands: List[Island], config: PackerConfig,
         if mx2 > 0 and my2 > 0:
             canvas[y:y2, x:x2] = np.maximum(canvas[y:y2, x:x2], isl.mask[:my2, :mx2])
 
-    if bounds is not None:
-        cx1, cy1, cx2, cy2 = bounds
-    else:
-        ys, xs = np.where(canvas > 0)
-        if len(xs) == 0:
-            return []
-        cx1, cy1 = int(xs.min()), int(ys.min())
-        cx2, cy2 = int(xs.max()), int(ys.max())
+    # Estimate how many candidates to try
+    # Area of bounds / avg island area gives a rough upper bound
+    avg_area = sum(isl.area for isl in pool) / len(pool)
+    max_candidates = max(200, int((bw * bh) / max(avg_area, 1)) * 3)
 
-    step = max(1, min_size // 2)
-    regions = []
-
-    for sy in range(cy1, cy2 - min_size + 1, step):
-        for sx in range(cx1, cx2 - min_size + 1, step):
-            region = canvas[sy:sy + min_size, sx:sx + min_size]
-            if not region.any():
-                regions.append((sx, sy, min_size, min_size))
-                # Mark this area so we don't find overlapping regions
-                canvas[sy:sy + min_size, sx:sx + min_size] = 1
-
-    return regions
-
-
-def expand_into_gaps(islands: List[Island], source_islands: List[Island],
-                     config: PackerConfig, rng: random.Random,
-                     bounds: Optional[Tuple[int, int, int, int]] = None,
-                     ) -> int:
-    """
-    Find large empty regions in the current layout (within bounds) and place
-    randomly-rotated copies of source islands into them. The copies are added
-    to the islands list (mutated in place) so a subsequent force sim can
-    settle them.
-
-    Returns the number of copies added.
-    """
-    min_size = config.expand_min_gap_size
-    if min_size <= 0:
-        return 0
-
-    regions = find_empty_regions(islands, config, min_size, bounds)
-    if not regions:
-        return 0
-
-    # Build pool of source islands that could fit in min_size x min_size
-    # (checking both orientations since we randomly rotate)
-    pool = [isl for isl in source_islands
-            if min(isl.w, isl.h) <= min_size and max(isl.w, isl.h) <= min_size * 2]
-    if not pool:
-        # Fallback: any island whose smallest dimension fits
-        pool = [isl for isl in source_islands if min(isl.w, isl.h) <= min_size]
-    if not pool:
-        return 0
-
-    min_lo, min_hi = config.min_edge_distance_range
-    max_lo, max_hi = config.max_edge_distance_range
+    # Padding around each placed copy (ensures min gap)
+    pad = int(min_lo)
 
     added = 0
-    for (rx, ry, rw, rh) in regions:
-        # Pick a random source island
+    for _ in range(max_candidates):
+        # Pick a random source island and rotate
         src = rng.choice(pool)
-
-        # Randomly rotate
         mask = src.mask.copy()
-        angle = rng.choice([0, 90, 180, 270])
-        if angle != 0:
-            mask = np.rot90(mask, k=angle // 90)
+        if config.allow_rotation:
+            angle = rng.choice([0, 90, 180, 270])
+            if angle != 0:
+                mask = np.rot90(mask, k=angle // 90)
 
-        h, w = mask.shape
+        mh, mw = mask.shape
 
-        # Check if it fits in the region
-        if w > rw or h > rh:
+        # Random position within bounds (scattered, like initial_placement)
+        px = rng.randint(bx1, max(bx1, bx2 - mw))
+        py = rng.randint(by1, max(by1, by2 - mh))
+
+        # Bounds check
+        if px + mw > W or py + mh > H or px < 0 or py < 0:
+            continue
+
+        # Check padded region is empty (no overlap with existing content)
+        rx1 = max(0, px - pad)
+        ry1 = max(0, py - pad)
+        rx2 = min(W, px + mw + pad)
+        ry2 = min(H, py + mh + pad)
+        if canvas[ry1:ry2, rx1:rx2].any():
+            continue
+
+        # Also verify this position is *near* existing content so we don't
+        # place islands out in empty fringe.  Check a larger surround.
+        surround_pad = min_size * 2
+        sx1 = max(0, px - surround_pad)
+        sy1 = max(0, py - surround_pad)
+        sx2 = min(W, px + mw + surround_pad)
+        sy2 = min(H, py + mh + surround_pad)
+        if not canvas[sy1:sy2, sx1:sx2].any():
             continue
 
         copy = Island(
@@ -724,11 +726,22 @@ def expand_into_gaps(islands: List[Island], source_islands: List[Island],
         )
         compute_island_boxes(copy, config)
 
-        # Place centered in the region
-        copy.x = float(rx + (rw - w) // 2)
-        copy.y = float(ry + (rh - h) // 2)
+        copy.x = float(px)
+        copy.y = float(py)
         copy.vx = 0.0
         copy.vy = 0.0
+
+        # Paint onto occupancy canvas so subsequent checks see this copy
+        cx1_p = int(round(copy.x))
+        cy1_p = int(round(copy.y))
+        cx2_p = min(cx1_p + copy.w, W)
+        cy2_p = min(cy1_p + copy.h, H)
+        cmx = cx2_p - cx1_p
+        cmy = cy2_p - cy1_p
+        if cmx > 0 and cmy > 0:
+            canvas[cy1_p:cy2_p, cx1_p:cx2_p] = np.maximum(
+                canvas[cy1_p:cy2_p, cx1_p:cx2_p], copy.mask[:cmy, :cmx]
+            )
 
         islands.append(copy)
         added += 1
@@ -794,8 +807,9 @@ def fill_gaps(islands: List[Island], config: PackerConfig) -> Tuple[int, List[Is
     content_x2 = int(xs.max())
     content_y2 = int(ys.max())
 
-    # Check radius: a gap is only valid if nearby pixels contain island content
-    check_radius = box_size * 2
+    # Check radius: a gap is only valid if nearby pixels contain island content.
+    # Use a tighter radius to avoid placing copies at the cluster fringe.
+    check_radius = box_size * 3
 
     copies_placed = 0
     new_islands = []
@@ -1025,17 +1039,17 @@ def pack_islands(
     if config.expand_min_gap_size > 0:
         t_expand = time.time()
 
-        # Capture the initial cluster bounding box (with some margin)
-        margin = config.expand_min_gap_size
+        # Capture the initial cluster bounding box (no margin — keep expansion
+        # strictly within the original cluster footprint to avoid edge buildup)
         all_x1 = min(isl.x for isl in islands)
         all_y1 = min(isl.y for isl in islands)
         all_x2 = max(isl.x + isl.w for isl in islands)
         all_y2 = max(isl.y + isl.h for isl in islands)
         expand_bounds = (
-            max(0, int(all_x1) - margin),
-            max(0, int(all_y1) - margin),
-            min(config.canvas_size[0], int(all_x2) + margin),
-            min(config.canvas_size[1], int(all_y2) + margin),
+            max(0, int(all_x1)),
+            max(0, int(all_y1)),
+            min(config.canvas_size[0], int(all_x2)),
+            min(config.canvas_size[1], int(all_y2)),
         )
         print(f"  Expansion bounds: ({expand_bounds[0]},{expand_bounds[1]})-({expand_bounds[2]},{expand_bounds[3]})")
 
@@ -1172,7 +1186,7 @@ if __name__ == "__main__":
         split_aspect_ratio=1.0,
         max_splits=2,
         expand_min_gap_size=40,
-        expand_max_rounds=10,
+        expand_max_rounds=3,
         max_iterations=3000,
         force_strength=2.0,
         attraction_strength=3.0,
