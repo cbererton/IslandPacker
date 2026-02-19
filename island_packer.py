@@ -6,6 +6,7 @@ edge-to-edge spacing using:
   - Connected Component Labeling (extraction)
   - Force-Directed Separation (packing)
   - Per-island randomized min/max distances for organic spacing
+  - Multi-box representation for large/elongated islands
 
 Dependencies: pip install opencv-python numpy Pillow
 """
@@ -38,6 +39,16 @@ class PackerConfig:
     # Set both to 0 to disable max distance enforcement.
     max_edge_distance_range: Tuple[int, int] = (45, 70)
 
+    # Islands with area >= this threshold AND aspect ratio >= split_aspect_ratio
+    # get split into 2 bounding boxes along their longest axis.
+    # This lets other islands nestle closer to elongated shapes.
+    # 0 = disabled (no splitting)
+    split_area_threshold: int = 2000
+
+    # Minimum aspect ratio (max_dim / min_dim) to trigger splitting.
+    # Only islands that are both large AND elongated get split.
+    split_aspect_ratio: float = 1.8
+
     # Filter: skip islands smaller than this many pixels (noise removal)
     min_island_area: int = 50
 
@@ -46,6 +57,9 @@ class PackerConfig:
 
     # Padding around the canvas border — islands won't be placed within this
     canvas_border_padding: int = 30
+
+    # After packing, crop output to this many pixels from the nearest island edge
+    crop_padding: int = 5
 
     # Force-directed simulation settings
     max_iterations: int = 3000       # Max physics steps
@@ -79,6 +93,11 @@ class Island:
     my_min_dist: float = 20.0
     my_max_dist: float = 50.0
 
+    # Sub-boxes: list of (local_x, local_y, w, h) relative to island top-left.
+    # For single-box islands: [(0, 0, mask_w, mask_h)]
+    # For split islands: two boxes covering each half's tight bounding box.
+    boxes: List[Tuple[int, int, int, int]] = field(default_factory=list)
+
     # Placement state (set during packing)
     x: float = 0.0           # Top-left x on canvas
     y: float = 0.0           # Top-left y on canvas
@@ -110,6 +129,67 @@ class Island:
 
 
 # ---------------------------------------------------------------------------
+# Multi-box splitting
+# ---------------------------------------------------------------------------
+
+def compute_island_boxes(island: Island, config: PackerConfig) -> None:
+    """
+    Compute sub-boxes for an island. Large elongated islands get split into
+    two bounding boxes along their longest dimension. Each box is a tight
+    bounding rect of the actual pixels in that half.
+    """
+    h, w = island.mask.shape
+    should_split = (
+        config.split_area_threshold > 0
+        and island.area >= config.split_area_threshold
+        and max(w, h) / (min(w, h) + 1e-6) >= config.split_aspect_ratio
+    )
+
+    if not should_split:
+        island.boxes = [(0, 0, w, h)]
+        return
+
+    # Split along the longest dimension
+    if w >= h:
+        # Split horizontally: left half and right half
+        mid = w // 2
+        left_mask = island.mask[:, :mid]
+        right_mask = island.mask[:, mid:]
+
+        island.boxes = []
+        for offset_x, half_mask in [(0, left_mask), (mid, right_mask)]:
+            # Find tight bounding box of actual pixels in this half
+            ys, xs = np.where(half_mask > 0)
+            if len(xs) == 0:
+                continue
+            bx = int(xs.min())
+            by = int(ys.min())
+            bw = int(xs.max()) - bx + 1
+            bh = int(ys.max()) - by + 1
+            island.boxes.append((offset_x + bx, by, bw, bh))
+    else:
+        # Split vertically: top half and bottom half
+        mid = h // 2
+        top_mask = island.mask[:mid, :]
+        bottom_mask = island.mask[mid:, :]
+
+        island.boxes = []
+        for offset_y, half_mask in [(0, top_mask), (mid, bottom_mask)]:
+            ys, xs = np.where(half_mask > 0)
+            if len(xs) == 0:
+                continue
+            bx = int(xs.min())
+            by = int(ys.min())
+            bw = int(xs.max()) - bx + 1
+            bh = int(ys.max()) - by + 1
+            island.boxes.append((bx, offset_y + by, bw, bh))
+
+    # Fallback: if splitting produced no boxes (shouldn't happen), use full BB
+    if not island.boxes:
+        island.boxes = [(0, 0, w, h)]
+
+
+# ---------------------------------------------------------------------------
 # Step 1: Extraction via Connected Component Labeling
 # ---------------------------------------------------------------------------
 
@@ -126,29 +206,24 @@ def extract_islands(image_path: str, config: PackerConfig) -> List[Island]:
     _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
 
     # Connected Component Labeling
-    # Returns: num_labels, label_map, stats, centroids
     num_labels, label_map, stats, centroids = cv2.connectedComponentsWithStats(
         binary, connectivity=8
     )
 
     islands = []
-    # Label 0 is background — skip it
     for label_id in range(1, num_labels):
         area = stats[label_id, cv2.CC_STAT_AREA]
 
-        # Area filters
         if area < config.min_island_area:
             continue
         if config.max_island_area > 0 and area > config.max_island_area:
             continue
 
-        # Extract tight crop
         x = stats[label_id, cv2.CC_STAT_LEFT]
         y = stats[label_id, cv2.CC_STAT_TOP]
         w = stats[label_id, cv2.CC_STAT_WIDTH]
         h = stats[label_id, cv2.CC_STAT_HEIGHT]
 
-        # Crop the label map to this component's bounding box
         roi = label_map[y:y+h, x:x+w]
         mask = np.where(roi == label_id, 255, 0).astype(np.uint8)
 
@@ -170,23 +245,16 @@ def extract_islands(image_path: str, config: PackerConfig) -> List[Island]:
 # Step 2: Distance measurement utilities
 # ---------------------------------------------------------------------------
 
-
 def measure_cardinal_distances(
     islands: List[Island], canvas_size: Tuple[int, int]
 ) -> List[dict]:
     """
-    For each island, cast rays from its center in 8 cardinal directions
-    (N, NE, E, SE, S, SW, W, NW). Measure the edge-to-edge distance from
-    this island's edge to the nearest other island in that direction.
-
-    Returns a list (one entry per island) of dicts with keys like:
-      {"id": 5, "N": 32.0, "NE": inf, "E": 18.5, ...}
-    where inf means no island was found in that direction within the canvas.
+    For each island, cast rays from its center in 8 cardinal directions.
+    Measure edge-to-edge distance to nearest other island in that direction.
     """
     W, H = canvas_size
     canvas = np.zeros((H, W), dtype=np.uint8)
 
-    # Paint all islands
     for isl in islands:
         x, y = int(round(isl.x)), int(round(isl.y))
         x2, y2 = min(x + isl.w, W), min(y + isl.h, H)
@@ -194,7 +262,6 @@ def measure_cardinal_distances(
         if mx2 > 0 and my2 > 0:
             canvas[y:y2, x:x2] = np.maximum(canvas[y:y2, x:x2], isl.mask[:my2, :mx2])
 
-    # Build a label map so we can tell which island a pixel belongs to
     label_canvas = np.zeros((H, W), dtype=np.int32)
     for idx, isl in enumerate(islands):
         x, y = int(round(isl.x)), int(round(isl.y))
@@ -202,18 +269,11 @@ def measure_cardinal_distances(
         mx2, my2 = x2 - x, y2 - y
         if mx2 > 0 and my2 > 0:
             mask_region = isl.mask[:my2, :mx2] > 0
-            label_canvas[y:y2, x:x2][mask_region] = idx + 1  # 1-indexed
+            label_canvas[y:y2, x:x2][mask_region] = idx + 1
 
-    # 8 cardinal unit direction vectors
     directions = {
-        "N":  ( 0, -1),
-        "NE": ( 1, -1),
-        "E":  ( 1,  0),
-        "SE": ( 1,  1),
-        "S":  ( 0,  1),
-        "SW": (-1,  1),
-        "W":  (-1,  0),
-        "NW": (-1, -1),
+        "N":  ( 0, -1), "NE": ( 1, -1), "E":  ( 1,  0), "SE": ( 1,  1),
+        "S":  ( 0,  1), "SW": (-1,  1), "W":  (-1,  0), "NW": (-1, -1),
     }
 
     results = []
@@ -223,7 +283,6 @@ def measure_cardinal_distances(
         entry = {"id": isl.id}
 
         for dir_name, (ddx, ddy) in directions.items():
-            # Step 1: Walk outward from center until we leave this island's pixels
             px, py = cx, cy
             exited = False
             while 0 <= px < W and 0 <= py < H:
@@ -237,11 +296,8 @@ def measure_cardinal_distances(
                 entry[dir_name] = float('inf')
                 continue
 
-            # (px, py) is now the first pixel outside this island along this ray
-            edge_x, edge_y = px - ddx, py - ddy  # last pixel inside island
+            edge_x, edge_y = px - ddx, py - ddy
 
-            # Step 2: Continue walking until we hit another island pixel or leave canvas
-            gap_start_x, gap_start_y = px, py
             found = False
             while 0 <= px < W and 0 <= py < H:
                 if canvas[py, px] > 0 and label_canvas[py, px] != label_id:
@@ -253,7 +309,6 @@ def measure_cardinal_distances(
             if not found:
                 entry[dir_name] = float('inf')
             else:
-                # Distance from island edge to the hit pixel
                 dist = math.sqrt((px - edge_x) ** 2 + (py - edge_y) ** 2)
                 entry[dir_name] = dist
 
@@ -264,29 +319,56 @@ def measure_cardinal_distances(
 
 def measure_all_distances(islands: List[Island], canvas_size: Tuple[int, int]) -> dict:
     """
-    After packing, measure nearest-neighbor edge-to-edge distances using
-    vectorized bounding box gap computation. Cardinal ray measurement
-    provides the precise pixel-level distances.
+    Measure nearest-neighbor edge-to-edge distances using multi-box BB gaps.
+    For each pair of islands, compute the minimum gap across all box-to-box
+    combinations.
     """
     n = len(islands)
     if n < 2:
         return {"min_gap": 0, "max_gap": 0, "mean_gap": 0, "islands_measured": 0}
 
-    # Pack into arrays
-    xs = np.array([isl.x for isl in islands])
-    ys = np.array([isl.y for isl in islands])
-    ws = np.array([isl.w for isl in islands], dtype=np.float64)
-    hs = np.array([isl.h for isl in islands], dtype=np.float64)
+    # Build flat arrays of all boxes with their parent island index
+    all_box_x = []
+    all_box_y = []
+    all_box_w = []
+    all_box_h = []
+    box_owner = []  # which island each box belongs to
 
-    # BB edge-to-edge gaps (vectorized)
-    gap_x = np.maximum(xs[None, :] - (xs[:, None] + ws[:, None]), 0) + \
-            np.maximum(xs[:, None] - (xs[None, :] + ws[None, :]), 0)
-    gap_y = np.maximum(ys[None, :] - (ys[:, None] + hs[:, None]), 0) + \
-            np.maximum(ys[:, None] - (ys[None, :] + hs[None, :]), 0)
+    for i, isl in enumerate(islands):
+        for (bx, by, bw, bh) in isl.boxes:
+            all_box_x.append(isl.x + bx)
+            all_box_y.append(isl.y + by)
+            all_box_w.append(float(bw))
+            all_box_h.append(float(bh))
+            box_owner.append(i)
+
+    bxs = np.array(all_box_x)
+    bys = np.array(all_box_y)
+    bws = np.array(all_box_w)
+    bhs = np.array(all_box_h)
+    owners = np.array(box_owner)
+    m = len(bxs)
+
+    # Pairwise BB edge-to-edge gap (all boxes)
+    gap_x = np.maximum(bxs[None, :] - (bxs[:, None] + bws[:, None]), 0) + \
+            np.maximum(bxs[:, None] - (bxs[None, :] + bws[None, :]), 0)
+    gap_y = np.maximum(bys[None, :] - (bys[:, None] + bhs[:, None]), 0) + \
+            np.maximum(bys[:, None] - (bys[None, :] + bhs[None, :]), 0)
     edge_dist = np.sqrt(gap_x * gap_x + gap_y * gap_y)
-    np.fill_diagonal(edge_dist, np.inf)
 
-    min_distances = edge_dist.min(axis=1)
+    # Mask out same-island box pairs
+    same_island = owners[:, None] == owners[None, :]
+    edge_dist[same_island] = np.inf
+
+    # For each island, find the minimum gap to any box of any OTHER island
+    min_distances = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        my_boxes = np.where(owners == i)[0]
+        other_boxes = np.where(owners != i)[0]
+        if len(my_boxes) == 0 or len(other_boxes) == 0:
+            min_distances[i] = np.inf
+            continue
+        min_distances[i] = edge_dist[np.ix_(my_boxes, other_boxes)].min()
 
     return {
         "min_gap": round(float(min_distances.min()), 1),
@@ -303,40 +385,32 @@ def measure_all_distances(islands: List[Island], canvas_size: Tuple[int, int]) -
 def initial_placement(islands: List[Island], config: PackerConfig) -> None:
     """
     Place islands in a scattered cluster near the canvas center.
-    Uses a Poisson-disk-like jittered placement to avoid grid artifacts.
-    Each island is placed at a random position within a loose cluster,
-    with enough spread for forces to separate them organically.
     """
     rng = random.Random(config.seed)
     W, H = config.canvas_size
 
-    # Midpoint of the distance ranges — used to size the cluster
     avg_min = sum(config.min_edge_distance_range) / 2.0
     avg_max = sum(config.max_edge_distance_range) / 2.0
     target_gap = (avg_min + avg_max) / 2.0
 
-    # Estimate average island size
     avg_size = math.sqrt(sum(isl.area for isl in islands) / len(islands))
 
     n = len(islands)
-
-    # Cluster radius: pack islands into a roughly circular region
-    # Area needed ≈ n * (avg_island_size + target_gap)^2
     cell_size = avg_size + target_gap
     cluster_area = n * cell_size * cell_size
-    cluster_radius = math.sqrt(cluster_area / math.pi) * 0.85  # tighter packing
+    cluster_radius = math.sqrt(cluster_area / math.pi) * 0.85
 
     cx_canvas, cy_canvas = W / 2.0, H / 2.0
 
     for isl in islands:
-        # Apply random rotation
         if config.allow_rotation:
             angle = rng.choice([0, 90, 180, 270])
             if angle != 0:
                 isl.mask = np.rot90(isl.mask, k=angle // 90)
 
-        # Place at random position within the circular cluster
-        # Use rejection sampling for uniform distribution in a circle
+        # Compute sub-boxes after rotation (mask dimensions may have changed)
+        compute_island_boxes(isl, config)
+
         while True:
             rx = rng.uniform(-cluster_radius, cluster_radius)
             ry = rng.uniform(-cluster_radius, cluster_radius)
@@ -348,7 +422,6 @@ def initial_placement(islands: List[Island], config: PackerConfig) -> None:
         isl.vx = 0.0
         isl.vy = 0.0
 
-    # Clamp all to canvas
     for isl in islands:
         clamp_to_canvas(isl, config)
 
@@ -363,16 +436,14 @@ def clamp_to_canvas(isl: Island, config: PackerConfig) -> None:
 
 def run_force_simulation(islands: List[Island], config: PackerConfig) -> None:
     """
-    Force-directed layout with per-island distance constraints.
+    Force-directed layout with per-island distance constraints and multi-box
+    overlap detection.
 
-    Each island has its own my_min_dist and my_max_dist. For any pair (i, j):
-      - effective_min = (my_min_dist_i + my_min_dist_j) / 2
-      - effective_max = (my_max_dist_i + my_max_dist_j) / 2
+    Each island may have 1 or 2 sub-boxes. Repulsion checks overlap between
+    all box pairs across different islands. Forces are accumulated per island.
 
-    This creates organic, non-uniform spacing.
-
-    Vectorized with NumPy — all pairwise distances and forces computed as
-    bulk array operations.
+    Attraction uses per-island min edge distance across all box pairs to find
+    nearest neighbor.
     """
     n = len(islands)
     strength = config.force_strength
@@ -382,12 +453,39 @@ def run_force_simulation(islands: List[Island], config: PackerConfig) -> None:
     W_canvas, H_canvas = config.canvas_size
     pad = config.canvas_border_padding
 
-    # Pack island geometry into contiguous arrays
+    # --- Build box-level arrays ---
+    # Each island has 1 or 2 boxes. We flatten all boxes into arrays
+    # and track which island each box belongs to.
+    box_local_x = []  # box x offset relative to island top-left
+    box_local_y = []
+    box_w = []
+    box_h = []
+    box_island = []  # index of parent island
+
+    for i, isl in enumerate(islands):
+        for (bx, by, bw, bh) in isl.boxes:
+            box_local_x.append(float(bx))
+            box_local_y.append(float(by))
+            box_w.append(float(bw))
+            box_h.append(float(bh))
+            box_island.append(i)
+
+    blx = np.array(box_local_x, dtype=np.float64)  # (m,)
+    bly = np.array(box_local_y, dtype=np.float64)
+    bw_arr = np.array(box_w, dtype=np.float64)
+    bh_arr = np.array(box_h, dtype=np.float64)
+    bowner = np.array(box_island, dtype=np.int64)
+    m = len(blx)
+
+    # Pre-compute same-island mask (m x m boolean)
+    same_island = bowner[:, None] == bowner[None, :]
+
+    # Island-level arrays
     pos = np.zeros((n, 2), dtype=np.float64)
     vel = np.zeros((n, 2), dtype=np.float64)
-    dims = np.zeros((n, 2), dtype=np.float64)  # w, h per island
-    min_dists = np.zeros(n, dtype=np.float64)   # per-island min distance
-    max_dists = np.zeros(n, dtype=np.float64)   # per-island max distance
+    dims = np.zeros((n, 2), dtype=np.float64)
+    min_dists = np.zeros(n, dtype=np.float64)
+    max_dists = np.zeros(n, dtype=np.float64)
 
     for i, isl in enumerate(islands):
         pos[i, 0] = isl.x
@@ -399,72 +497,95 @@ def run_force_simulation(islands: List[Island], config: PackerConfig) -> None:
 
     half_dims = dims / 2.0
 
-    # Pairwise effective distances: average of both islands' values
-    # eff_min[i,j] = (min_dists[i] + min_dists[j]) / 2
-    eff_min = (min_dists[:, None] + min_dists[None, :]) / 2.0   # (n, n)
-    eff_max = (max_dists[:, None] + max_dists[None, :]) / 2.0   # (n, n)
-    half_eff_min = eff_min / 2.0  # half of effective min distance per pair
-
-    # Check if max distance enforcement is enabled
     use_max_dist = config.max_edge_distance_range[1] > 0
 
+    # Per-box min_dist (inherited from parent island)
+    box_min_dist = min_dists[bowner]  # (m,)
+    half_box_min = box_min_dist / 2.0
+
+    print(f"  {n} islands -> {m} boxes ({m - n} split)")
+
     for iteration in range(config.max_iterations):
-        # Centers: pos + half_dims
+        # --- Compute absolute box positions from island positions ---
+        # box_abs_x[b] = pos[owner[b], 0] + box_local_x[b]
+        box_abs_x = pos[bowner, 0] + blx  # (m,)
+        box_abs_y = pos[bowner, 1] + bly
+
+        # Island centers (for force direction)
         centers = pos + half_dims  # (n, 2)
 
-        # --- Vectorized repulsion (bounding box overlap with per-pair padding) ---
-        # Each pair has its own padding: half_eff_min[i,j]
-        # For efficiency, use per-island half-padding and sum for pairs
-        half_min_per_island = min_dists / 2.0  # (n,)
+        # --- Multi-box repulsion ---
+        # Expanded bounding boxes per box (padded by half min_dist)
+        bb_x1 = box_abs_x - half_box_min
+        bb_y1 = box_abs_y - half_box_min
+        bb_x2 = box_abs_x + bw_arr + half_box_min
+        bb_y2 = box_abs_y + bh_arr + half_box_min
 
-        bb_x1 = pos[:, 0] - half_min_per_island
-        bb_y1 = pos[:, 1] - half_min_per_island
-        bb_x2 = pos[:, 0] + dims[:, 0] + half_min_per_island
-        bb_y2 = pos[:, 1] + dims[:, 1] + half_min_per_island
-
-        # Pairwise overlap
+        # Pairwise overlap (m x m)
         ox = np.minimum(bb_x2[:, None], bb_x2[None, :]) - np.maximum(bb_x1[:, None], bb_x1[None, :])
         oy = np.minimum(bb_y2[:, None], bb_y2[None, :]) - np.maximum(bb_y1[:, None], bb_y1[None, :])
 
         overlapping = (ox > 0) & (oy > 0)
-        np.fill_diagonal(overlapping, False)
+        overlapping[same_island] = False  # ignore boxes from the same island
 
-        # Direction vectors
-        dx = centers[:, 0:1] - centers[:, 0:1].T
-        dy = centers[:, 1:2] - centers[:, 1:2].T
-        dist = np.sqrt(dx * dx + dy * dy) + 1e-6
+        # Direction: from island center i toward island center j
+        # Map box pairs back to island pairs for direction
+        owner_i = bowner[:, None].repeat(m, axis=1)  # (m, m)
+        owner_j = bowner[None, :].repeat(m, axis=0)
 
-        # Force magnitude: overlap_area / min_expanded_area
+        dx_ij = centers[owner_i, 0] - centers[owner_j, 0]  # (m, m)
+        dy_ij = centers[owner_i, 1] - centers[owner_j, 1]
+        dist_ij = np.sqrt(dx_ij * dx_ij + dy_ij * dy_ij) + 1e-6
+
+        # Force magnitude based on overlap area
         overlap_area = np.maximum(ox, 0) * np.maximum(oy, 0)
-        expanded_w = dims[:, 0:1] + min_dists[:, None]  # use island i's min_dist for expansion
-        expanded_h = dims[:, 1:2] + min_dists[:, None]
-        expanded_area_i = expanded_w * expanded_h
-        expanded_area_j = (dims[:, 0:1].T + min_dists[None, :]) * (dims[:, 1:2].T + min_dists[None, :])
-        min_area = np.minimum(expanded_area_i, expanded_area_j)
+        exp_w = bw_arr + box_min_dist
+        exp_h = bh_arr + box_min_dist
+        exp_area = exp_w * exp_h
+        min_area = np.minimum(exp_area[:, None], exp_area[None, :])
         force_mag = np.minimum(overlap_area / (min_area + 1e-6), 1.0)
         force_mag[~overlapping] = 0.0
 
-        rep_fx = (dx / dist) * force_mag
-        rep_fy = (dy / dist) * force_mag
+        # Force vectors at box level
+        rep_fx = (dx_ij / dist_ij) * force_mag
+        rep_fy = (dy_ij / dist_ij) * force_mag
 
+        # Accumulate forces per island (sum over all boxes belonging to each island)
         forces = np.zeros((n, 2), dtype=np.float64)
-        forces[:, 0] = rep_fx.sum(axis=1) * strength
-        forces[:, 1] = rep_fy.sum(axis=1) * strength
+        # Sum forces on all boxes belonging to island i
+        box_force_x = rep_fx.sum(axis=1)  # (m,) — total force on each box
+        box_force_y = rep_fy.sum(axis=1)
+        np.add.at(forces[:, 0], bowner, box_force_x)
+        np.add.at(forces[:, 1], bowner, box_force_y)
+        forces *= strength
 
-        # --- Vectorized attraction (nearest neighbor, per-island max dist) ---
+        # --- Attraction (nearest neighbor using multi-box edge distance) ---
         if use_max_dist:
-            # BB edge-to-edge gap
-            gap_x = np.maximum(pos[:, 0:1].T - (pos[:, 0:1] + dims[:, 0:1]), 0) + \
-                    np.maximum(pos[:, 0:1] - (pos[:, 0:1].T + dims[:, 0:1].T), 0)
-            gap_y = np.maximum(pos[:, 1:2].T - (pos[:, 1:2] + dims[:, 1:2]), 0) + \
-                    np.maximum(pos[:, 1:2] - (pos[:, 1:2].T + dims[:, 1:2].T), 0)
-            edge_dist = np.sqrt(gap_x * gap_x + gap_y * gap_y)
+            # BB edge-to-edge gap between all box pairs
+            gap_x = np.maximum(box_abs_x[None, :] - (box_abs_x[:, None] + bw_arr[:, None]), 0) + \
+                    np.maximum(box_abs_x[:, None] - (box_abs_x[None, :] + bw_arr[None, :]), 0)
+            gap_y = np.maximum(box_abs_y[None, :] - (box_abs_y[:, None] + bh_arr[:, None]), 0) + \
+                    np.maximum(box_abs_y[:, None] - (box_abs_y[None, :] + bh_arr[None, :]), 0)
+            box_edge_dist = np.sqrt(gap_x * gap_x + gap_y * gap_y)
+            box_edge_dist[same_island] = np.inf
 
-            np.fill_diagonal(edge_dist, np.inf)
-            nn_idx = np.argmin(edge_dist, axis=1)
-            nn_edge = edge_dist[np.arange(n), nn_idx]
+            # For each island, find nearest other island (min edge dist across all box pairs)
+            nn_edge = np.full(n, np.inf, dtype=np.float64)
+            nn_idx = np.zeros(n, dtype=np.int64)
 
-            # Each island uses its own max_dist threshold
+            for i in range(n):
+                my_boxes = np.where(bowner == i)[0]
+                other_boxes = np.where(bowner != i)[0]
+                if len(my_boxes) == 0 or len(other_boxes) == 0:
+                    continue
+                sub = box_edge_dist[np.ix_(my_boxes, other_boxes)]
+                min_val = sub.min()
+                nn_edge[i] = min_val
+                # Find which island the nearest box belongs to
+                flat_idx = sub.argmin()
+                other_box_idx = other_boxes[flat_idx % len(other_boxes)]
+                nn_idx[i] = bowner[other_box_idx]
+
             needs_pull = nn_edge > max_dists
             if needs_pull.any():
                 pull_idx = np.where(needs_pull)[0]
@@ -529,6 +650,22 @@ def render_packed_canvas(islands: List[Island], config: PackerConfig) -> np.ndar
     return canvas
 
 
+def crop_to_content(canvas: np.ndarray, padding: int = 5) -> np.ndarray:
+    """
+    Crop the canvas to the bounding box of all white pixels plus padding.
+    """
+    ys, xs = np.where(canvas > 0)
+    if len(xs) == 0:
+        return canvas  # nothing to crop
+
+    x_min = max(0, int(xs.min()) - padding)
+    x_max = min(canvas.shape[1], int(xs.max()) + 1 + padding)
+    y_min = max(0, int(ys.min()) - padding)
+    y_max = min(canvas.shape[0], int(ys.max()) + 1 + padding)
+
+    return canvas[y_min:y_max, x_min:x_max]
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -539,7 +676,7 @@ def pack_islands(
     config: Optional[PackerConfig] = None,
 ) -> dict:
     """
-    Full pipeline: extract → place → simulate → render → measure.
+    Full pipeline: extract -> place -> simulate -> render -> crop -> measure.
     Returns a stats dict with distance measurements.
     """
     if config is None:
@@ -559,6 +696,9 @@ def pack_islands(
     print(f"Min edge distance range: {min_lo}-{min_hi}px")
     if max_hi > 0:
         print(f"Max edge distance range: {max_lo}-{max_hi}px (8-cardinal)")
+    if config.split_area_threshold > 0:
+        print(f"Multi-box split: area >= {config.split_area_threshold} AND aspect >= {config.split_aspect_ratio}")
+    print(f"Crop padding: {config.crop_padding}px")
     print()
 
     # 1. Extract
@@ -567,9 +707,9 @@ def pack_islands(
     print(f"Extraction: {time.time()-t0:.2f}s | {len(islands)} islands\n")
 
     if not islands:
-        raise ValueError("No islands found — check min_island_area or image threshold")
+        raise ValueError("No islands found -- check min_island_area or image threshold")
 
-    # Shuffle randomly — no size bias in placement
+    # Shuffle randomly
     rng = random.Random(config.seed)
     rng.shuffle(islands)
 
@@ -588,6 +728,10 @@ def pack_islands(
     # 2. Initial placement (scattered, not grid)
     print("Placing islands (scattered cluster)...")
     initial_placement(islands, config)
+
+    split_count = sum(1 for isl in islands if len(isl.boxes) > 1)
+    total_boxes = sum(len(isl.boxes) for isl in islands)
+    print(f"  {split_count} islands split into 2 boxes ({total_boxes} total boxes)")
     print("Done.\n")
 
     # 3. Force-directed simulation
@@ -598,18 +742,26 @@ def pack_islands(
 
     # 4. Render
     canvas = render_packed_canvas(islands, config)
-    cv2.imwrite(output_path, canvas)
-    print(f"Saved: {output_path}")
 
-    # 5. Measure distances (BB nearest neighbor)
-    print("\nMeasuring edge-to-edge distances (BB)...")
+    # 5. Crop to content
+    cropped = crop_to_content(canvas, config.crop_padding)
+    cv2.imwrite(output_path, cropped)
+    print(f"Saved: {output_path}")
+    print(f"  Full canvas: {canvas.shape[1]}x{canvas.shape[0]}")
+    print(f"  Cropped:     {cropped.shape[1]}x{cropped.shape[0]}")
+
+    # 6. Measure distances (multi-box BB nearest neighbor)
+    print("\nMeasuring edge-to-edge distances (multi-box BB)...")
     stats = measure_all_distances(islands, config.canvas_size)
     stats["total_islands"] = len(islands)
+    stats["split_islands"] = split_count
+    stats["total_boxes"] = total_boxes
     stats["canvas"] = f"{config.canvas_size[0]}x{config.canvas_size[1]}"
+    stats["cropped"] = f"{cropped.shape[1]}x{cropped.shape[0]}"
     stats["min_edge_distance_range"] = f"{min_lo}-{min_hi}"
     stats["max_edge_distance_range"] = f"{max_lo}-{max_hi}"
 
-    # 6. Measure 8-cardinal-direction distances
+    # 7. Measure 8-cardinal-direction distances
     if max_hi > 0:
         print("Measuring 8-cardinal-direction distances...")
         cardinal = measure_cardinal_distances(islands, config.canvas_size)
@@ -628,11 +780,8 @@ def pack_islands(
                 min_cardinal_nearest = min(min_cardinal_nearest, nearest)
                 max_cardinal_nearest = max(max_cardinal_nearest, nearest)
 
-                # Check if ALL 8 directions exceed this island's max distance
                 isl_max = islands[idx].my_max_dist
-                all_exceed = all(
-                    entry[d] > isl_max for d in dir_names
-                )
+                all_exceed = all(entry[d] > isl_max for d in dir_names)
                 if all_exceed:
                     violations += 1
 
@@ -677,6 +826,9 @@ if __name__ == "__main__":
         max_edge_distance_range=(max_lo, max_hi),
         min_island_area=50,
         canvas_border_padding=30,
+        crop_padding=5,
+        split_area_threshold=2000,
+        split_aspect_ratio=1.8,
         max_iterations=3000,
         force_strength=2.0,
         attraction_strength=3.0,
